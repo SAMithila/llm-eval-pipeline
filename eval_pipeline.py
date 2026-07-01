@@ -3,18 +3,22 @@ from sentence_transformers import SentenceTransformer
 import csv
 import os
 from datetime import datetime
+import time
 
-# 1. Load a free local embedding model
+
+# ───────────── Load a free local embedding model ─────────────
 model = SentenceTransformer('all-MiniLM-L6-v2')   # downloads once, 
 
-# 2. Your cosine similarity function
+# ───────────── Functions ─────────────
+
+# 1. Cosine similarity function
 def cosine_similarity(a, b):
     dot = np.dot(a, b)
     norm_a = np.linalg.norm(a)
     norm_b = np.linalg.norm(b)
     return dot / (norm_a * norm_b + 1e-9)
 
-# 3. Faithfulness scorer
+# 2. Faithfulness scorer
 def faithfulness_score(response: str, context: str, threshold=0.7) -> dict:
     """Does the response stay faithful to the retrieved context?"""
     resp_emb = model.encode(response)
@@ -26,7 +30,7 @@ def faithfulness_score(response: str, context: str, threshold=0.7) -> dict:
         "label": "✅ faithful" if score >= threshold else " ❌ hallucination_risk"
     }
 
-# Relevancy scorer
+# 3. Relevancy scorer
 def score_relevancy(query: str, response: str, threshold = 0.6) -> dict:
     q_emb = model.encode(query)
     resp_emb = model.encode(response)
@@ -37,7 +41,7 @@ def score_relevancy(query: str, response: str, threshold = 0.6) -> dict:
         "label": "✅ relevant" if score >= threshold else " ❌ off_topic"
     }
 
-# Coherence scorer
+# 4. Coherence scorer
 def score_coherence(response: str) -> dict:
     """
     Measures logical flow between consecutive sentences.
@@ -78,7 +82,158 @@ def score_coherence(response: str) -> dict:
         "label": "✅ coherent" if score >= threshold else "❌ incoherent"
     }
 
-# Ten test cases
+# 5. Batch scoring function
+def batch_score_all(test_cases: list, threshold_faith=0.7,
+                    threshold_relev=0.6, threshold_coher=0.4) -> list:
+    """
+    Batch version of the full evaluation pipeline.
+    Encodes all responses and contexts in one call each
+    instead of encoding them one by one in a loop.
+    """
+    # ── Step 1: extract all texts ──────────────────────────────────
+    queries    = [tc["query"]    for tc in test_cases]
+    responses  = [tc["response"] for tc in test_cases]
+    contexts   = [tc["context"]  for tc in test_cases]
+
+    # ── Step 2: batch encode everything in 3 calls (not 30) ────────
+    print("  [Batch] Encoding all queries...")
+    q_embs   = model.encode(queries)    # shape: (N, 384)
+
+    print("  [Batch] Encoding all responses...")
+    r_embs   = model.encode(responses)  # shape: (N, 384)
+
+    print("  [Batch] Encoding all contexts...")
+    c_embs   = model.encode(contexts)   # shape: (N, 384)
+
+    # ── Step 3: batch cosine similarity (matrix ops) ───────────────
+    def batch_cosine(a_matrix, b_matrix):
+        """Row-wise cosine similarity between two (N, d) matrices."""
+        dots  = np.sum(a_matrix * b_matrix, axis=1)          # (N,)
+        norms = (np.linalg.norm(a_matrix, axis=1) *
+                 np.linalg.norm(b_matrix, axis=1) + 1e-9)    # (N,)
+        return dots / norms                                   # (N,)
+
+    faith_scores = batch_cosine(r_embs, c_embs)   # response vs context
+    relev_scores = batch_cosine(q_embs, r_embs)   # query vs response
+
+    # ── Step 4: build results list ─────────────────────────────────
+    results = []
+    for i, tc in enumerate(test_cases):
+        f_score = round(float(faith_scores[i]), 3)
+        r_score = round(float(relev_scores[i]), 3)
+
+        faith = {
+            "score": f_score,
+            "pass":  f_score >= threshold_faith,
+            "label": "✅ faithful" if f_score >= threshold_faith
+                     else "❌ hallucination_risk"
+        }
+        relev = {
+            "score": r_score,
+            "pass":  r_score >= threshold_relev,
+            "label": "✅ relevant" if r_score >= threshold_relev
+                     else "❌ off_topic"
+        }
+        # Coherence still runs per-response (needs sentence splitting)
+        coher = score_coherence(tc["response"])
+
+        results.append({
+            "test_id":      i + 1,
+            "query":        tc["query"],
+            "faithfulness": faith,
+            "relevancy":    relev,
+            "coherence":    coher,
+            "overall_pass": faith["pass"] and relev["pass"] and coher["pass"]
+        })
+
+    return results
+
+# 6. CSV Logging
+def save_to_csv (results: list, filename= "eval_results.csv"):
+    """Save evalution results to CSV with timestamp)"""
+
+    file_exits = os.path.exists(filename)
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    with open(filename, mode="a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=[
+            "timestamp", "test_id", "query", "faithfulness_score", "faithfulness_pass", "relevancy_score", "relevancy_pass", "coherence_score", "coherence_pass", "overall_pass"
+        ])
+
+        # Write header only if file is new
+        if not file_exits:
+            writer.writeheader()
+
+        for r in results:
+            writer.writerow({
+                "timestamp":          timestamp,
+                "test_id":            r["test_id"],
+                "query":              r["query"][:60],
+                "faithfulness_score": r["faithfulness"]["score"], 
+                "faithfulness_pass":  r["faithfulness"]["pass"],
+                "relevancy_score":    r["relevancy"]["score"], 
+                "relevancy_pass":     r["relevancy"]["pass"],
+                "coherence_score":    r["coherence"]["score"],
+                "coherence_pass":  r["coherence"]["pass"],
+                "overall_pass":       r["overall_pass"]
+            })
+    print(f"\n Results saved -> {filename}")
+
+
+# 7. Summary Dashboard
+def print_dashboard(results:list):
+    """Print a human readable summary dashboard of the evaluation results"""
+    total    = len(results)
+    f_scores = [r["faithfulness"]["score"] for r in results]
+    r_scores = [r["relevancy"]["score"] for r in results]
+    f_passed = sum(1 for r in results if r["faithfulness"]["pass"])
+    r_passed = sum(1 for r in results if r["relevancy"]["pass"])
+    c_scores = [r["coherence"]["score"] for r in results]
+    c_passed = sum(1 for r in results if r["coherence"]["pass"])
+    overall  = sum(1 for r in results if r["overall_pass"])
+    failed   = [r for r in results if not r["overall_pass"]]
+
+    print("\n" + "="*60)
+    print(" Evalution Dashboard")
+    print("\n" + "="*60)
+    print(f" Run timestamp  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f" Total test cases: {total}")
+    print()
+
+    print(f" Faithfulness")
+    print(f" Pass rate: {f_passed}/{total} ({f_passed/total*100:.0f}%)")
+    print(f" Avg score: {np.mean(f_scores):.3f}")
+    print(f" Min score: {np.min(r_scores):.3f} ← worst case")
+    print()
+
+    print(f" Relevancy")
+    print(f" Pass rate: {r_passed}/{total} ({r_passed/total*100:.0f}%)")
+    print(f" Avg score: {np.mean(r_scores):.3f}")
+    print(f" Min score: {np.min(r_scores):.3f} ← worst case")
+    print()
+
+    print(f"  Coherence")
+    print(f"    Pass rate       : {c_passed}/{total}  ({c_passed/total*100:.0f}%)")
+    print(f"    Avg score       : {np.mean(c_scores):.3f}")
+    print(f"    Min score       : {np.min(c_scores):.3f}  ← worst case")
+    print()
+
+    print(f" Overall pass rate: {overall}/{total} ({overall/total*100:.0f}%)")
+    print()
+
+    if failed:
+        print(f" Failed cases ({len(failed)}):")
+        for r in failed:
+            print(f" Test{r['test_id']:02d}: {r['query'][:45]}...")
+            if not r["faithfulness"]["pass"]:
+                print(f"  Faithfulness: {r['faithfulness']['score']} ← below threshold")
+            if not r["relevancy"]["pass"]:
+                print(f"  Relevancy:    {r['relevancy']['score']} ← below threshold")
+        
+    print("\n" + "="*60)
+
+
+# ───────────── Ten test cases ─────────────
 test_cases = [
     {
         "query":    "What is the refund policy for Apple Music?",
@@ -132,93 +287,12 @@ test_cases = [
         "context":  "Apple One is a bundled subscription service combining Apple Music, Apple TV+, Apple Arcade, and iCloud+ at a discounted price."
     },
 ]
-
-# Part B: CSV Logging
-def save_to_csv (results: list, filename= "eval_results.csv"):
-    """Save evalution results to CSV with timestamp)"""
-
-    file_exits = os.path.exists(filename)
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    with open(filename, mode="a", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=[
-            "timestamp", "test_id", "query", "faithfulness_score", "faithfulness_pass", "relevancy_score", "relevancy_pass", "coherence_score", "coherence_pass", "overall_pass"
-        ])
-
-        # Write header only if file is new
-        if not file_exits:
-            writer.writeheader()
-
-        for r in results:
-            writer.writerow({
-                "timestamp":          timestamp,
-                "test_id":            r["test_id"],
-                "query":              r["query"][:60],
-                "faithfulness_score": r["faithfulness"]["score"], 
-                "faithfulness_pass":  r["faithfulness"]["pass"],
-                "relevancy_score":    r["relevancy"]["score"], 
-                "relevancy_pass":     r["relevancy"]["pass"],
-                "coherence_score":    r["coherence"]["score"],
-                "coherence_pass":  r["coherence"]["pass"],
-                "overall_pass":       r["overall_pass"]
-            })
-    print(f"\n Results saved -> {filename}")
-
-
-# Part B: Summary Dashboard
-def print_dashboard(results:list):
-    """Print a human readable summary dashboard of the evaluation results"""
-    total    = len(results)
-    f_scores = [r["faithfulness"]["score"] for r in results]
-    r_scores = [r["relevancy"]["score"] for r in results]
-    f_passed = sum(1 for r in results if r["faithfulness"]["pass"])
-    r_passed = sum(1 for r in results if r["relevancy"]["pass"])
-    c_scores = [r["coherence"]["score"] for r in results]
-    c_passed = sum(1 for r in results if r["coherence"]["pass"])
-    overall  = sum(1 for r in results if r["overall_pass"])
-    failed   = [r for r in results if not r["overall_pass"]]
-
-    print("\n" + "="*60)
-    print(" Evalution Dashboard")
-    print("\n" + "="*60)
-    print(f" Run timestamp  : {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-    print(f" Total test cases: {total}")
-    print()
-
-    print(f" Faithfulness")
-    print(f" Pass rate: {f_passed}/{total} ({f_passed/total*100:.0f}%)")
-    print(f" Avg score: {np.mean(f_scores):.3f}")
-    print(f" Min score: {np.min(r_scores):.3f} ← worst case")
-    print()
-
-    print(f" Relevancy")
-    print(f" Pass rate: {r_passed}/{total} ({r_passed/total*100:.0f}%)")
-    print(f" Avg score: {np.mean(r_scores):.3f}")
-    print(f" Min score: {np.min(r_scores):.3f} ← worst case")
-    print()
-
-    print(f"  Coherence")
-    print(f"    Pass rate       : {c_passed}/{total}  ({c_passed/total*100:.0f}%)")
-    print(f"    Avg score       : {np.mean(c_scores):.3f}")
-    print(f"    Min score       : {np.min(c_scores):.3f}  ← worst case")
-    print()
-
-    print(f" Overall pass rate: {overall}/{total} ({overall/total*100:.0f}%)")
-    print()
-
-    if failed:
-        print(f" Failed cases ({len(failed)}):")
-        for r in failed:
-            print(f" Test{r['test_id']:02d}: {r['query'][:45]}...")
-            if not r["faithfulness"]["pass"]:
-                print(f"  Faithfulness: {r['faithfulness']['score']} ← below threshold")
-            if not r["relevancy"]["pass"]:
-                print(f"  Relevancy:    {r['relevancy']['score']} ← below threshold")
-        
-    print("\n" + "="*60)
     
+
+# ───────────── V1: FIRST TEST RUN (commented out) ────────── 
 """
 # Run evaluation + print report (First test run)
+
 print("\n" + "="*60)
 print("  APPLE MEDIA SERVICES — LLM EVALUATION REPORT")
 print("\n" + "="*60)
@@ -244,7 +318,7 @@ print(f" SUMMARY: {passed}/10 passed | {failed}/10 failed")
 print(f" Hallucination caught in test 9: "
       f" {'Yes✅' if not faithfulness_score(test_cases[8]['response'], test_cases[8]['context'])['pass'] else 'No ❌'}")
 print("\n" + "="*60)
-"""
+
 
 # Collects results for dashboard + CSV logging
 
@@ -280,3 +354,89 @@ for i, tc in enumerate(test_cases):
 # Run dashboard + save CSV
 print_dashboard(results)
 save_to_csv(results)
+"""
+
+
+# ───────────── V2: PART B — sequential loop with dashboard + CSV ─────────────
+"""
+print("\n" + "="*60)
+print("  APPLE MEDIA SERVICES — LLM EVALUATION REPORT")
+print("="*60)
+
+results_v2 = []
+
+for i, tc in enumerate(test_cases):
+    faith        = faithfulness_score(tc["response"], tc["context"])
+    relev        = score_relevancy(tc["query"], tc["response"])
+    coher        = score_coherence(tc["response"])
+    overall_pass = faith["pass"] and relev["pass"] and coher["pass"]
+
+    results_v2.append({
+        "test_id":      i + 1,
+        "query":        tc["query"],
+        "faithfulness": faith,
+        "relevancy":    relev,
+        "coherence":    coher,
+        "overall_pass": overall_pass
+    })
+
+    print(f"\nTest {i+1:02d}: {tc['query'][:50]}...")
+    print(f"  Faithfulness : {faith['score']}  {faith['label']}")
+    print(f"  Relevancy    : {relev['score']}  {relev['label']}")
+    print(f"  Coherence    : {coher['score']}  {coher['label']}")
+    print(f"  Overall      : {'✅ PASS' if overall_pass else '❌ FAIL'}")
+
+print_dashboard(results_v2)
+save_to_csv(results_v2)
+"""
+
+
+# ───────────── V3: COMPARISON: Sequential vs batch comparison ─────────────
+
+print("\n" + "="*60)
+print("  APPLE MEDIA SERVICES — LLM EVALUATION REPORT")
+print("="*60)
+
+# Sequential timing (original approach)
+print("\n[Sequential approach]")
+start = time.time()
+results_seq = []
+for i, tc in enumerate(test_cases):
+    faith        = faithfulness_score(tc["response"], tc["context"])
+    relev        = score_relevancy(tc["query"], tc["response"])
+    coher        = score_coherence(tc["response"])
+    overall_pass = faith["pass"] and relev["pass"] and coher["pass"]
+    results_seq.append({
+        "test_id":      i + 1,
+        "query":        tc["query"],
+        "faithfulness": faith,
+        "relevancy":    relev,
+        "coherence":    coher,
+        "overall_pass": overall_pass
+    })
+sequential_time = time.time() - start
+print(f"Sequential time: {sequential_time:.4f}s")
+
+# Batch timing (upgraded approach)
+print("\n[Batch approach]")
+start = time.time()
+results_batch = batch_score_all(test_cases)
+batch_time = time.time() - start
+print(f"Batch time: {batch_time:.4f}s")
+print(f"Speedup:    {sequential_time/batch_time:.1f}x faster")
+
+# Use batch results for dashboard + CSV
+print("\n[Results from batch pipeline]")
+for r in results_batch:
+    print(f"\nTest {r['test_id']:02d}: {r['query'][:50]}...")
+    print(f"  Faithfulness : {r['faithfulness']['score']}  "
+          f"{r['faithfulness']['label']}")
+    print(f"  Relevancy    : {r['relevancy']['score']}  "
+          f"{r['relevancy']['label']}")
+    print(f"  Coherence    : {r['coherence']['score']}  "
+          f"{r['coherence']['label']}")
+    print(f"  Overall      : "
+          f"{'✅ PASS' if r['overall_pass'] else '❌ FAIL'}")
+
+print_dashboard(results_batch)
+save_to_csv(results_batch)
