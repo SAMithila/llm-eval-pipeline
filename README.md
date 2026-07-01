@@ -17,6 +17,12 @@ No API dependency — runs entirely on-device using sentence-transformers.
 ## Stack
 Python · NumPy · sentence-transformers (all-MiniLM-L6-v2) · CSV logging
 
+## Performance
+- **Batch upgrade**: replaced sequential encoding with batched 
+  matrix operations — benchmarked 2.8x faster on 10 test cases
+- Sequential: 3.15s → Batch: 1.13s on Apple Silicon MacBook Air
+- Scales further at higher volumes (7x speedup at 100 responses)
+
 ## Run
 ```bash
 pip install sentence-transformers numpy
